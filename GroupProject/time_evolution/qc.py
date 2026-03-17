@@ -10,25 +10,43 @@ InitPattern = Literal["all0", "all1", "alternating10"]
 
 if TYPE_CHECKING:
     from qiskit import QuantumCircuit
-    from qiskit.quantum_info import SparsePauliOp, Statevector
+    from qiskit.quantum_info import DensityMatrix, SparsePauliOp, Statevector
+    from qiskit_aer import AerSimulator
+    from qiskit_aer.noise import NoiseModel
 
 
-def _import_qiskit() -> tuple[type["QuantumCircuit"], type["Statevector"], type["SparsePauliOp"]]:
+def _import_qiskit() -> tuple[
+    type["QuantumCircuit"],
+    type["Statevector"],
+    type["SparsePauliOp"],
+    type["DensityMatrix"],
+]:
     try:
         from qiskit import QuantumCircuit
-        from qiskit.quantum_info import SparsePauliOp, Statevector
+        from qiskit.quantum_info import DensityMatrix, SparsePauliOp, Statevector
     except ImportError as exc:  # pragma: no cover - only triggered when qiskit missing
         raise ImportError(
             "qiskit is required for GroupProject.time_evolution.qc. "
             "Install it with: pip install qiskit"
         ) from exc
-    return QuantumCircuit, Statevector, SparsePauliOp
+    return QuantumCircuit, Statevector, SparsePauliOp, DensityMatrix
+
+
+def _import_qiskit_aer() -> tuple[type["AerSimulator"], type["NoiseModel"], object]:
+    try:
+        from qiskit_aer import AerSimulator
+        from qiskit_aer.noise import NoiseModel, pauli_error
+    except ImportError as exc:  # pragma: no cover - only triggered when qiskit-aer missing
+        raise ImportError(
+            "qiskit-aer is required for noisy Qiskit simulation. "
+            "Install it with: pip install qiskit-aer"
+        ) from exc
+    return AerSimulator, NoiseModel, pauli_error
 
 
 def _site_to_qubit(site: int, L: int) -> int:
     if not (0 <= site < L):
         raise ValueError("site index out of range")
-    # Keep site ordering consistent with spin_chain.py (site 0 is left-most/MSB).
     return L - 1 - site
 
 
@@ -80,7 +98,7 @@ def build_initial_circuit(
     phi: float,
     rotate_site: int | None = None,
 ) -> tuple["QuantumCircuit", str, int]:
-    QuantumCircuit, _, _ = _import_qiskit()
+    QuantumCircuit, _, _, _ = _import_qiskit()
 
     bitstring = build_initial_bitstring(L=L, init_pattern=init_pattern)
     site = rotate_site if rotate_site is not None else (L // 2)
@@ -111,7 +129,7 @@ def initial_statevector(
     phi: float,
     rotate_site: int | None = None,
 ) -> tuple[np.ndarray, str, int]:
-    _, Statevector, _ = _import_qiskit()
+    _, Statevector, _, _ = _import_qiskit()
     init_circuit, bitstring, site = build_initial_circuit(
         L=L, init_pattern=init_pattern, phi=phi, rotate_site=rotate_site
     )
@@ -132,9 +150,6 @@ def append_xxz_two_site_evolution(
     qi = _site_to_qubit(i, L)
     qj = _site_to_qubit(j, L)
 
-    # qiskit definitions:
-    # rxx(theta) = exp(-i * theta/2 * (X kron X)), same for ryy/rzz.
-    # We need exp(+i * dt * (XX + YY + Jz ZZ)).
     circuit.rxx(-2.0 * dt, qi, qj)
     circuit.ryy(-2.0 * dt, qi, qj)
     circuit.rzz(-2.0 * Jz * dt, qi, qj)
@@ -207,7 +222,7 @@ def evolve_trotter_states_qiskit(
     times: np.ndarray,
     order: int = 2,
 ) -> np.ndarray:
-    QuantumCircuit, Statevector, _ = _import_qiskit()
+    QuantumCircuit, Statevector, _, _ = _import_qiskit()
 
     times = np.asarray(times, dtype=float)
     if times.ndim != 1:
@@ -216,6 +231,8 @@ def evolve_trotter_states_qiskit(
         raise ValueError("state0 shape must be (2**L,)")
     if len(times) == 0:
         return np.zeros((0, state0.size), dtype=np.complex128)
+    if np.any(np.diff(times) < -1e-15):
+        raise ValueError("times must be non-decreasing")
 
     states = np.empty((len(times), state0.size), dtype=np.complex128)
     current = Statevector(state0)
@@ -237,10 +254,92 @@ def evolve_trotter_states_qiskit(
     return states
 
 
-def build_local_pauli_ops(L: int) -> tuple[list["SparsePauliOp"], list["SparsePauliOp"], list["SparsePauliOp"]]:
+def _build_single_qubit_pauli_error(p_x: float, p_z: float) -> object:
+    if p_x < 0.0 or p_z < 0.0:
+        raise ValueError("noise probabilities must be non-negative")
+    if p_x + p_z > 1.0:
+        raise ValueError("noise probabilities must satisfy p_x + p_z <= 1")
+
+    _, _, pauli_error = _import_qiskit_aer()
+    return pauli_error([("I", 1.0 - p_x - p_z), ("X", p_x), ("Z", p_z)])
+
+
+def _build_qiskit_aer_noise_model(p_x: float, p_z: float) -> "NoiseModel":
+    _, NoiseModel, _ = _import_qiskit_aer()
+
+    noise_model = NoiseModel()
+    if p_x == 0.0 and p_z == 0.0:
+        return noise_model
+
+    single_qubit_error = _build_single_qubit_pauli_error(p_x=p_x, p_z=p_z)
+    two_qubit_error = single_qubit_error.tensor(single_qubit_error)
+
+    for gate in ("x", "h", "rz"):
+        noise_model.add_all_qubit_quantum_error(single_qubit_error, [gate])
+    for gate in ("rxx", "ryy", "rzz"):
+        noise_model.add_all_qubit_quantum_error(two_qubit_error, [gate])
+    return noise_model
+
+
+def evolve_trotter_states_aer(
+    state0: np.ndarray,
+    L: int,
+    Jz: float,
+    boundary: Boundary,
+    times: np.ndarray,
+    p_x: float,
+    p_z: float,
+    order: int = 2,
+) -> np.ndarray:
+    QuantumCircuit, _, _, _ = _import_qiskit()
+    AerSimulator, _, _ = _import_qiskit_aer()
+
+    times = np.asarray(times, dtype=float)
+    if times.ndim != 1:
+        raise ValueError("times must be a 1D array")
+    if state0.shape != (2**L,):
+        raise ValueError("state0 shape must be (2**L,)")
+    if len(times) == 0:
+        return np.zeros((0, state0.size, state0.size), dtype=np.complex128)
+    if np.any(np.diff(times) < -1e-15):
+        raise ValueError("times must be non-decreasing")
+
+    circuit = QuantumCircuit(L)
+    circuit.set_statevector(state0)
+    circuit.save_density_matrix(label="rho_0")
+
+    step_cache: dict[float, QuantumCircuit] = {}
+    for idx in range(1, len(times)):
+        dt = float(times[idx] - times[idx - 1])
+        cache_key = float(np.round(dt, 15))
+        if cache_key not in step_cache:
+            step = QuantumCircuit(L)
+            append_trotter_interval(
+                step, L=L, Jz=Jz, dt=dt, boundary=boundary, order=order
+            )
+            step_cache[cache_key] = step
+        circuit.compose(step_cache[cache_key], inplace=True)
+        circuit.save_density_matrix(label=f"rho_{idx}")
+
+    simulator = AerSimulator(
+        method="density_matrix",
+        noise_model=_build_qiskit_aer_noise_model(p_x=p_x, p_z=p_z),
+    )
+    result = simulator.run(circuit).result()
+
+    states = np.empty((len(times), state0.size, state0.size), dtype=np.complex128)
+    data = result.data(0)
+    for idx in range(len(times)):
+        states[idx] = np.asarray(data[f"rho_{idx}"].data, dtype=np.complex128)
+    return states
+
+
+def build_local_pauli_ops(
+    L: int,
+) -> tuple[list["SparsePauliOp"], list["SparsePauliOp"], list["SparsePauliOp"]]:
     if L <= 0:
         raise ValueError("L must be positive")
-    _, _, SparsePauliOp = _import_qiskit()
+    _, _, SparsePauliOp, _ = _import_qiskit()
 
     x_ops: list[SparsePauliOp] = []
     y_ops: list[SparsePauliOp] = []
@@ -261,9 +360,10 @@ def build_local_pauli_ops(L: int) -> tuple[list["SparsePauliOp"], list["SparsePa
 def single_state_observables_qiskit(
     state: np.ndarray,
     L: int,
-    ops: tuple[list["SparsePauliOp"], list["SparsePauliOp"], list["SparsePauliOp"]] | None = None,
+    ops: tuple[list["SparsePauliOp"], list["SparsePauliOp"], list["SparsePauliOp"]]
+    | None = None,
 ) -> np.ndarray:
-    _, Statevector, _ = _import_qiskit()
+    _, Statevector, _, _ = _import_qiskit()
     if state.shape != (2**L,):
         raise ValueError("state shape must be (2**L,)")
 
@@ -278,6 +378,27 @@ def single_state_observables_qiskit(
     return out
 
 
+def _single_density_matrix_observables_qiskit(
+    state: np.ndarray,
+    L: int,
+    ops: tuple[list["SparsePauliOp"], list["SparsePauliOp"], list["SparsePauliOp"]]
+    | None = None,
+) -> np.ndarray:
+    _, _, _, DensityMatrix = _import_qiskit()
+    if state.shape != (2**L, 2**L):
+        raise ValueError("state shape must be (2**L, 2**L)")
+
+    x_ops, y_ops, z_ops = ops if ops is not None else build_local_pauli_ops(L)
+    dm = DensityMatrix(state)
+
+    out = np.zeros((L, 3), dtype=float)
+    for site in range(L):
+        out[site, 0] = float(np.real(dm.expectation_value(x_ops[site])))
+        out[site, 1] = float(np.real(dm.expectation_value(y_ops[site])))
+        out[site, 2] = float(np.real(dm.expectation_value(z_ops[site])))
+    return out
+
+
 def all_states_observables_qiskit(states: np.ndarray, L: int) -> np.ndarray:
     if states.ndim != 2 or states.shape[1] != 2**L:
         raise ValueError("states shape must be (n_times, 2**L)")
@@ -286,6 +407,19 @@ def all_states_observables_qiskit(states: np.ndarray, L: int) -> np.ndarray:
     out = np.zeros((states.shape[0], L, 3), dtype=float)
     for idx, state in enumerate(states):
         out[idx] = single_state_observables_qiskit(state=state, L=L, ops=ops)
+    return out
+
+
+def all_states_observables_aer(states: np.ndarray, L: int) -> np.ndarray:
+    if states.ndim != 3 or states.shape[1:] != (2**L, 2**L):
+        raise ValueError("states shape must be (n_times, 2**L, 2**L)")
+
+    ops = build_local_pauli_ops(L)
+    out = np.zeros((states.shape[0], L, 3), dtype=float)
+    for idx, state in enumerate(states):
+        out[idx] = _single_density_matrix_observables_qiskit(
+            state=state, L=L, ops=ops
+        )
     return out
 
 
@@ -312,10 +446,38 @@ def run_qiskit_trotter(
     return states, observables, bitstring, rotate_site
 
 
+def run_qiskit_trotter_aer(
+    cfg: QiskitSimulationConfig,
+    times: np.ndarray,
+    p_x: float,
+    p_z: float,
+    order: int = 2,
+) -> tuple[np.ndarray, np.ndarray, str, int]:
+    state0, bitstring, rotate_site = initial_statevector(
+        L=cfg.L,
+        init_pattern=cfg.init_pattern,
+        phi=cfg.phi,
+        rotate_site=cfg.rotate_site,
+    )
+    states = evolve_trotter_states_aer(
+        state0=state0,
+        L=cfg.L,
+        Jz=cfg.Jz,
+        boundary=cfg.boundary,
+        times=times,
+        p_x=p_x,
+        p_z=p_z,
+        order=order,
+    )
+    observables = all_states_observables_aer(states=states, L=cfg.L)
+    return states, observables, bitstring, rotate_site
+
+
 __all__ = [
     "Boundary",
     "InitPattern",
     "QiskitSimulationConfig",
+    "all_states_observables_aer",
     "all_states_observables_qiskit",
     "append_trotter_interval",
     "append_xxz_two_site_evolution",
@@ -324,8 +486,10 @@ __all__ = [
     "build_initial_circuit",
     "build_local_pauli_ops",
     "build_time_evolution_circuit",
+    "evolve_trotter_states_aer",
     "evolve_trotter_states_qiskit",
     "initial_statevector",
     "run_qiskit_trotter",
+    "run_qiskit_trotter_aer",
     "single_state_observables_qiskit",
 ]
